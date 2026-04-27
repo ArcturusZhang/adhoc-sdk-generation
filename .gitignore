@@ -1,0 +1,6 @@
+# ignore VS / build artifacts
+bin/
+obj/
+.vs/
+*.user
+
