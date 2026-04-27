@@ -48,12 +48,25 @@ For the chosen operations, produce:
    - Each method returns:
      - **Non-LRO**: `Response<T>` / `Task<Response<T>>` (or `Response` if the operation has no body).
      - **LRO** (operation has `x-ms-long-running-operation: true`): `ArmOperation<T>` / `Task<ArmOperation<T>>` (or `ArmOperation` if no final body), with a `WaitUntil` parameter as the **first** argument.
-   - Use `ClientDiagnostics` + `using var scope = _clientDiagnostics.CreateScope("<ClientClassName>.<MethodName>")` around each call.
+   - **Do NOT use `ClientDiagnostics`**. It is `internal` to `Azure.Core` and unusable from an external assembly. Skip activity-tracing scopes; method bodies just call `_pipeline.Send` / `SendAsync` and process the response.
 2. **`<ClientClassName>Options.cs`** — derived from `Azure.Core.ClientOptions`, exposes `ServiceVersion` enum + `Version` property.
 3. **Model classes** — one `.cs` file per swagger schema reachable from the chosen operations' parameters and responses. Models are **plain DTOs** with public read/write properties; no `IUtf8JsonSerializable` / `IJsonModel` interfaces, no `ModelReaderWriter` plumbing — just `internal static` `Deserialize<TypeName>(JsonElement)` and `void Write(Utf8JsonWriter)` helpers used by the client methods.
 4. **`<ClientClassName>RestClient.cs`** — internal helper that owns request construction (`CreateXxxRequest(...)` returning `HttpMessage`), kept separate from the public client for readability. This mirrors generated mgmt SDK structure but is hand-written and minimal.
 
 Do **not** emit anything for swagger schemas that aren't reached transitively from the chosen operations.
+
+### Azure.Core public-API constraints (important)
+
+The skill emits code that consumes only the **public** surface of `Azure.Core`. Several types that look obvious from the generated SDKs are `internal` and **must not** be referenced:
+
+| Don't use (internal) | Use instead (public) |
+|----------------------|----------------------|
+| `Azure.Core.Pipeline.ClientDiagnostics` | omit — no activity scopes |
+| `Azure.Core.RawRequestUriBuilder` | `Azure.Core.RequestUriBuilder` (same `Reset` / `AppendPath` / `AppendQuery` API) |
+| `Azure.Core.Utf8JsonRequestContent` | write to a `MemoryStream` with `Utf8JsonWriter`, then `RequestContent.Create(stream.ToArray())` |
+| `Azure.Core.HttpMessageSanitizer` etc. | not needed |
+
+If a future Azure.Core release exposes these, this section can be relaxed.
 
 ## Process
 
@@ -77,7 +90,9 @@ Common-types refs (e.g., `ErrorResponse`, `SystemData`, `TrackedResource`, `Reso
 | `ErrorResponse` / `ErrorDetail` | `Azure.ResponseError` (and let `RequestFailedException` carry it) |
 | `Sku` (common-types) | `Azure.ResourceManager.Models.ResourceSku` (or skip and use a local DTO if shape differs) |
 
-If a model in the closure derives from one of the above, generate it as a partial DTO that contains the *additional* properties only and document the base mapping in a `// Maps to: <swagger name> (extends <CommonType>)` comment at the top of the file.
+If a model in the closure derives from one of the above, **prefer self-contained DTOs** for the initial version: emit the inherited fields (`id`, `name`, `type`, `location`, `tags`, `systemData`) inline rather than subclassing `TrackedResourceData` / `ResourceData`. Those base classes have `internal` setters and a constructor that requires `AzureLocation`, which doesn't round-trip cleanly from raw JSON in a hand-written DTO. Add a comment like `// Maps to: <swagger name> (extends TrackedResource — fields inlined; see skill open question #6)`.
+
+`SubResource` from `common-types/v1/common.json` (just `{ id: string }`) should be emitted as a small local `WritableSubResource` DTO rather than mapped to `Azure.Core.WritableSubResource` (whose setter requires `ResourceIdentifier`).
 
 ### 3. Emit files
 
@@ -115,7 +130,7 @@ For non-LRO operations, return `Response<T>.FromValue(model, response)`.
 
 ### 5. Request construction conventions
 
-In `<ClientClassName>RestClient.cs`, build requests using `RequestUriBuilder` and the `HttpPipeline`:
+In `<ClientClassName>RestClient.cs`, build requests using the **public** `RequestUriBuilder` and `HttpPipeline`. Use a `MemoryStream` + `Utf8JsonWriter` for the body (do not reference the internal `Utf8JsonRequestContent`):
 
 ```csharp
 internal HttpMessage CreateXxxRequest(string subscriptionId, string resourceGroupName, ...)
@@ -123,7 +138,7 @@ internal HttpMessage CreateXxxRequest(string subscriptionId, string resourceGrou
     var message = _pipeline.CreateMessage();
     var request = message.Request;
     request.Method = RequestMethod.<Verb>;
-    var uri = new RawRequestUriBuilder();
+    var uri = new RequestUriBuilder();
     uri.Reset(_endpoint);
     uri.AppendPath("/subscriptions/", false);
     uri.AppendPath(subscriptionId, true);
@@ -133,9 +148,12 @@ internal HttpMessage CreateXxxRequest(string subscriptionId, string resourceGrou
     request.Headers.Add("Accept", "application/json");
     if (<has body>) {
         request.Headers.Add("Content-Type", "application/json");
-        var content = new Utf8JsonRequestContent();
-        body.Write(content.JsonWriter);
-        request.Content = content;
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+        {
+            body.Write(writer);
+        }
+        request.Content = RequestContent.Create(stream.ToArray());
     }
     return message;
 }
@@ -174,5 +192,6 @@ These are intentionally left open for future iteration — when the user next in
 3. **`x-ms-client-flatten`** — currently ignored (properties stay nested). Decide whether to honor it.
 4. **Examples** — swagger `x-ms-examples` are ignored. Decide whether to emit XML doc comments referencing them.
 5. **Naming** — current plan keeps swagger PascalCase names verbatim. Decide on a casing/renaming policy (e.g., `Properties` → flatten, `Id` → `ResourceIdentifier`).
+6. **TrackedResource mapping** — the skill currently inlines `id/name/type/location/tags/systemData` instead of subclassing `TrackedResourceData`. Decide whether to add a recipe (e.g., a separate "rich" mode that emits an `[InternalsVisibleTo]`-friendly partial type, or a converter layer) for callers who want the Azure.ResourceManager type hierarchy.
 
 When iterating on this skill, update the table above as decisions are made and move resolved items into the main body.
