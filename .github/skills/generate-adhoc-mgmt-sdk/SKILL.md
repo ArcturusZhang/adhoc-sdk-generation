@@ -80,19 +80,15 @@ If a future Azure.Core release exposes these, this section can be relaxed.
 
 Starting from each selected operation's `parameters` (body / query / path / header) and each `responses.*.schema`, walk all `$ref`s transitively. The resulting set is the **schema closure** — the only models that need to be emitted.
 
-Common-types refs (e.g., `ErrorResponse`, `SystemData`, `TrackedResource`, `Resource`, `ProxyResource`) should be **mapped to their existing `Azure.ResourceManager` equivalents** rather than re-emitted:
+**Emit every schema in the closure verbatim.** Do **not** redirect any swagger schema to an existing .NET type from `Azure.ResourceManager.*`, `Azure.Core`, or anywhere else — not even for "obvious" common types (`Resource`, `ProxyResource`, `TrackedResource`, `SystemData`, `SubResource`, `ErrorResponse`, `Sku`, etc.). Each one becomes its own DTO with its own properties, regardless of how familiar it looks.
 
-| Swagger schema | Use this .NET type |
-|----------------|--------------------|
-| `Resource` / `ProxyResource` | `Azure.ResourceManager.Models.ResourceData` |
-| `TrackedResource` | `Azure.ResourceManager.Models.TrackedResourceData` |
-| `SystemData` | `Azure.ResourceManager.Models.SystemData` |
-| `ErrorResponse` / `ErrorDetail` | `Azure.ResponseError` (and let `RequestFailedException` carry it) |
-| `Sku` (common-types) | `Azure.ResourceManager.Models.ResourceSku` (or skip and use a local DTO if shape differs) |
+The same rule applies to **property types**: keep them as the swagger declares them. A `string`-typed `id` stays `string` — do **not** promote it to `ResourceIdentifier`. A `string`-typed `location` stays `string` — do **not** promote it to `AzureLocation`. A date-time string stays `DateTimeOffset?` only because that's the natural .NET mapping for `format: date-time`; no other "smart" substitutions.
 
-If a model in the closure derives from one of the above, **prefer self-contained DTOs** for the initial version: emit the inherited fields (`id`, `name`, `type`, `location`, `tags`, `systemData`) inline rather than subclassing `TrackedResourceData` / `ResourceData`. Those base classes have `internal` setters and a constructor that requires `AzureLocation`, which doesn't round-trip cleanly from raw JSON in a hand-written DTO. Add a comment like `// Maps to: <swagger name> (extends TrackedResource — fields inlined; see skill open question #6)`.
+If the user wants any of these mapped to richer types (e.g., inherit `TrackedResourceData`, expose `ResourceIdentifier` instead of `string`), they will tell you **after** seeing the generated code. Do not anticipate it.
 
-`SubResource` from `common-types/v1/common.json` (just `{ id: string }`) should be emitted as a small local `WritableSubResource` DTO rather than mapped to `Azure.Core.WritableSubResource` (whose setter requires `ResourceIdentifier`).
+For `allOf` (inheritance) in the swagger, emit it as C# inheritance: a base class for the referenced schema, a derived class for the model that uses `allOf`. Both go through the normal closure walk.
+
+For error responses (`responses.default` / `4xx` / `5xx`), the client should throw `RequestFailedException` constructed from the raw `Response`. Do **not** emit DTOs for the error schema unless it appears in a non-error response — `RequestFailedException` already carries the response body and headers for the caller.
 
 ### 3. Emit files
 
@@ -164,10 +160,10 @@ Path parameters: use `AppendPath(value, true)` (escape) for user values and `App
 ### 6. Verify
 
 - Re-read every emitted file and confirm:
-  - All referenced types are in the closure or in the common-type mapping table.
+  - Every type referenced is either emitted in the destination folder or is a basic .NET type (`string`, `int`, `bool`, `DateTimeOffset`, collections, etc.) or comes from `Azure` / `Azure.Core` (`Response<T>`, `RequestFailedException`, `TokenCredential`, `HttpPipeline`, `RequestUriBuilder`, `RequestContent`, etc. — pipeline/transport plumbing only, **never** model types).
   - No `using` directive references a namespace that isn't actually used.
   - Each operation appears in `<ClientClassName>` exactly once with sync + async overloads.
-- Print a summary: number of files written, list of operations, list of models, list of common-type mappings used.
+- Print a summary: number of files written, list of operations, list of models emitted.
 
 Do **not** attempt to `dotnet build` — the destination folder has no `.csproj`. Build verification is out of scope for this skill (a follow-up skill can add that once the shape stabilizes).
 
@@ -180,6 +176,7 @@ Do **not** attempt to `dotnet build` — the destination folder has no `.csproj`
 - Invoking any code generator.
 - `IJsonModel` / `IPersistableModel` interface implementations.
 - API compatibility checks against an existing released package.
+- **Redirecting any swagger schema or property type to an existing .NET type** (e.g., `Resource` → `ResourceData`, `string` id → `ResourceIdentifier`, common `Sku` → `ResourceSku`). The skill emits the swagger as-is. Users may request specific mappings as a follow-up after seeing the generated output.
 
 These can be added in follow-up iterations as the shape of the output stabilizes.
 
@@ -191,7 +188,6 @@ These are intentionally left open for future iteration — when the user next in
 2. **`x-ms-pageable`** — currently each list operation returns a single `Response<T>`. Decide whether to expose `Pageable<T>` / `AsyncPageable<T>` for paged list operations.
 3. **`x-ms-client-flatten`** — currently ignored (properties stay nested). Decide whether to honor it.
 4. **Examples** — swagger `x-ms-examples` are ignored. Decide whether to emit XML doc comments referencing them.
-5. **Naming** — current plan keeps swagger PascalCase names verbatim. Decide on a casing/renaming policy (e.g., `Properties` → flatten, `Id` → `ResourceIdentifier`).
-6. **TrackedResource mapping** — the skill currently inlines `id/name/type/location/tags/systemData` instead of subclassing `TrackedResourceData`. Decide whether to add a recipe (e.g., a separate "rich" mode that emits an `[InternalsVisibleTo]`-friendly partial type, or a converter layer) for callers who want the Azure.ResourceManager type hierarchy.
+5. **Naming** — current plan keeps swagger PascalCase property names verbatim. Decide on a casing/renaming policy if real-world output looks awkward.
 
-When iterating on this skill, update the table above as decisions are made and move resolved items into the main body.
+When iterating on this skill, update the list above as decisions are made and move resolved items into the main body.
